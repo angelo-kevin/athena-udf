@@ -59,6 +59,11 @@ public class AthenaUDFHandler
         this.cachableSecretsManager = cachableSecretsManager;
     }
     
+    public String healthcheck(String input)
+    {
+        return input;
+    }
+    
     private byte[] calcHmacSha256(byte[] secretKey, byte[] message)
     {
         byte[] hmacSha256 = null;
