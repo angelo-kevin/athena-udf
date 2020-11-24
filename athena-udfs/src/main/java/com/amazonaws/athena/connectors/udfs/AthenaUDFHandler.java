@@ -23,22 +23,22 @@ import com.amazonaws.athena.connector.lambda.handlers.UserDefinedFunctionHandler
 import com.amazonaws.athena.connector.lambda.security.CachableSecretsManager;
 import com.amazonaws.services.secretsmanager.AWSSecretsManagerClient;
 import com.google.common.annotations.VisibleForTesting;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+import org.json.simple.JSONObject;
+import org.json.simple.parser.JSONParser;
 
-import javax.crypto.BadPaddingException;
-import javax.crypto.Cipher;
-import javax.crypto.IllegalBlockSizeException;
-import javax.crypto.NoSuchPaddingException;
+import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
-import java.io.ByteArrayOutputStream;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.security.InvalidKeyException;
-import java.security.NoSuchAlgorithmException;
+import java.net.URL;
+import java.text.SimpleDateFormat;
 import java.util.Base64;
-import java.util.zip.DataFormatException;
-import java.util.zip.Deflater;
-import java.util.zip.Inflater;
+import java.util.Date;
+import java.util.TimeZone;
 
 public class AthenaUDFHandler
         extends UserDefinedFunctionHandler
@@ -58,148 +58,75 @@ public class AthenaUDFHandler
         super(SOURCE_TYPE);
         this.cachableSecretsManager = cachableSecretsManager;
     }
-
-    /**
-     * Compresses a valid UTF-8 String using the zlib compression library.
-     * Encodes bytes with Base64 encoding scheme.
-     *
-     * @param input the String to be compressed
-     * @return the compressed String
-     */
-    public String compress(String input)
+    
+    private byte[] calcHmacSha256(byte[] secretKey, byte[] message)
     {
-        byte[] inputBytes = input.getBytes(StandardCharsets.UTF_8);
-
-        // create compressor
-        Deflater compressor = new Deflater();
-        compressor.setInput(inputBytes);
-        compressor.finish();
-
-        // compress bytes to output stream
-        byte[] buffer = new byte[4096];
-        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream(inputBytes.length);
-        while (!compressor.finished()) {
-            int bytes = compressor.deflate(buffer);
-            byteArrayOutputStream.write(buffer, 0, bytes);
-        }
-
+        byte[] hmacSha256 = null;
         try {
-            byteArrayOutputStream.close();
+            Mac mac = Mac.getInstance("HmacSHA256");
+            SecretKeySpec secretKeySpec = new SecretKeySpec(secretKey, "HmacSHA256");
+            mac.init(secretKeySpec);
+            hmacSha256 = mac.doFinal(message);
         }
-        catch (IOException e) {
-            throw new RuntimeException("Failed to close ByteArrayOutputStream", e);
+        catch (Exception e) {
+            throw new RuntimeException("Failed to calculate hmac-sha256", e);
         }
-
-        // return encoded string
-        byte[] compressedBytes = byteArrayOutputStream.toByteArray();
-        return Base64.getEncoder().encodeToString(compressedBytes);
+        return hmacSha256;
     }
-
+    
     /**
-     * Decompresses a valid String that has been compressed using the zlib compression library.
-     * Decodes bytes with Base64 decoding scheme.
+     * Converts employee_id to email with Talenta Data API
+     * 
      *
-     * @param input the String to be decompressed
-     * @return the decompressed String
+     * @param input the employee_id
+     * @return the returned email address
      */
-    public String decompress(String input)
+    public String convert(Long employeeID) throws Exception
     {
-        byte[] inputBytes = Base64.getDecoder().decode((input));
+        String hmacUsername = "TALENTA_DATA_API_USERNAME";
+        String hmacSecret = "TALENTA_DATA_API_SECRET";
+        String baseURL = "https://talenta-data-api.sleekr.id/v1/employee/";
 
-        // create decompressor
-        Inflater decompressor = new Inflater();
-        decompressor.setInput(inputBytes, 0, inputBytes.length);
+        //get request path
+        String urlString = baseURL + employeeID;
+        URL requestURL = new URL(urlString);
+        String requestPath = requestURL.getPath();
+        String requestLine = "GET" + ' ' + requestPath + " HTTP/1.1";
 
-        // decompress bytes to output stream
-        byte[] buffer = new byte[4096];
-        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream(inputBytes.length);
-        try {
-            while (!decompressor.finished()) {
-                int bytes = decompressor.inflate(buffer);
-                if (bytes == 0 && decompressor.needsInput()) {
-                    throw new DataFormatException("Input is truncated");
-                }
-                byteArrayOutputStream.write(buffer, 0, bytes);
-            }
-        }
-        catch (DataFormatException e) {
-            throw new RuntimeException("Failed to decompress string", e);
-        }
+        //date string code
+        final Date currentTime = new Date();
+        final SimpleDateFormat sdf = new SimpleDateFormat("E, dd MMM yyyy HH:mm:ss z");
+        sdf.setTimeZone(TimeZone.getTimeZone("GMT"));
+        String dateString = sdf.format(currentTime);
 
-        try {
-            byteArrayOutputStream.close();
-        }
-        catch (IOException e) {
-            throw new RuntimeException("Failed to close ByteArrayOutputStream", e);
-        }
+        //calculate HMAC 256
+        String temp = "date: " + dateString + "\n" + requestLine;
+        byte[] digest = calcHmacSha256(hmacSecret.getBytes(), temp.getBytes());
+        String signature = Base64.getEncoder().encodeToString(digest);
 
-        // return decoded string
-        byte[] decompressedBytes = byteArrayOutputStream.toByteArray();
-        return new String(decompressedBytes, StandardCharsets.UTF_8);
-    }
+        String hmacHeader = String.format("hmac username=\"%s\", algorithm=\"hmac-sha256\", headers=\"date request-line\", signature=\"%s\"", hmacUsername, signature);
 
-    /**
-     * This method decrypts the ciphertext with a data key stored AWS Secret Manager. Before using this function, create
-     * a secret in AWS Secret Manager. Do a base64 encode to your data key and convert it to string. Store it as
-     * _PLAINTEXT_ in the secret (do not include any quotes, brackets, etc). Also make sure to use DefaultEncryptionKey
-     * as the KMS key. Otherwise you would need to update athena-udfs.yaml to allow access to your KMS key.
-     *
-     * @param ciphertext
-     * @param secretName
-     * @return plaintext
-     */
-    public String decrypt(String ciphertext, String secretName)
-    {
-        String secretString = cachableSecretsManager.getSecret(secretName);
-        byte[] plaintextKey = Base64.getDecoder().decode(secretString);
+        CloseableHttpClient httpclient = HttpClients.createDefault();
 
-        try {
-            Cipher cipher = getCipher(Cipher.DECRYPT_MODE, plaintextKey);
-            byte[] encryptedContent = Base64.getDecoder().decode(ciphertext.getBytes());
-            byte[] plainTextBytes = cipher.doFinal(encryptedContent);
-            return new String(plainTextBytes);
-        }
-        catch (IllegalBlockSizeException | BadPaddingException e) {
-            throw new RuntimeException(e);
-        }
-    }
+        //Creating a HttpGet object
+        HttpGet httpget = new HttpGet(urlString);
+        httpget.setHeader("Authorization", hmacHeader);
+        httpget.setHeader("Date", dateString);
 
-    /**
-     * This method encrypts the plaintext with a data key stored AWS Secret Manager. Before using this function, create
-     * a secret in AWS Secret Manager. Do a base64 encode to your data key and convert it to string. Store it as
-     * _PLAINTEXT_ in the secret (do not include any quotes, brackets, etc). Also make sure to use DefaultEncryptionKey
-     * as the KMS key. Otherwise you would need to update athena-udfs.yaml to allow access to your KMS key.
-     *
-     * @param plaintext
-     * @param secretName
-     * @return ciphertext
-     */
-    public String encrypt(String plaintext, String secretName)
-    {
-        String secretString = cachableSecretsManager.getSecret(secretName);
-        byte[] plaintextKey = Base64.getDecoder().decode(secretString);
+        //Executing the Get request
+        HttpResponse httpresponse = httpclient.execute(httpget);
 
-        try {
-            Cipher cipher = getCipher(Cipher.ENCRYPT_MODE, plaintextKey);
-            byte[] encryptedContent = cipher.doFinal(plaintext.getBytes());
-            byte[] encodedContent = Base64.getEncoder().encode(encryptedContent);
-            return new String(encodedContent);
-        }
-        catch (IllegalBlockSizeException | BadPaddingException e) {
-            throw new RuntimeException(e);
-        }
-    }
+        //parsing response body to JSON
+        String responseBodyString = EntityUtils.toString(httpresponse.getEntity());
+        JSONParser parser = new JSONParser();
+        JSONObject responseJSON = (JSONObject) parser.parse(responseBodyString);
 
-    private Cipher getCipher(int cipherMode, byte[] plainTextDataKey)
-    {
-        try {
-            Cipher cipher = Cipher.getInstance("AES");
-            SecretKeySpec skeySpec = new SecretKeySpec(plainTextDataKey, "AES");
-            cipher.init(cipherMode, skeySpec);
-            return cipher;
-        }
-        catch (NoSuchPaddingException | NoSuchAlgorithmException | InvalidKeyException e) {
-            throw new RuntimeException(e);
-        }
+        JSONObject data = (JSONObject) responseJSON.get("data");
+        JSONObject personal = (JSONObject) data.get("personal");
+
+        //Get Email
+        String email = personal.get("email").toString();
+
+        return email;
     }
 }
